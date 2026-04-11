@@ -3,7 +3,7 @@ import os
 import time
 from typing import Any, Dict, List
 
-import streamlit as st
+import streamlit as st # type: ignore
 
 LOG_DIR = os.getenv("LOG_DIR", "/tmp/agriconnect-logs")
 
