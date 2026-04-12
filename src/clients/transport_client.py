@@ -48,24 +48,29 @@ TRANSPORT_TTL = 6 * 60 * 60  # 6 hours — data updates weekly
 # Formula: (rate_pct / 100) * benchmark_$/ton  /  bu_per_ton
 # Benchmark $/ton from AMS GTR methodology (St. Louis = $3.99 confirmed).
 # ---------------------------------------------------------------------------
+# Source: USDA AMS dataset deqi-uken description + Grain Transportation Reports
+# Benchmarks are 1976 Tariff No. 7 rates in $/SHORT TON (ton = 2,000 lbs)
 _BENCHMARK_PER_TON: Dict[str, float] = {
-    "Twin Cities":     5.20,
-    "Mid-Mississippi": 4.60,
-    "Illinois":        4.20,
-    "St. Louis":       3.99,
-    "Cairo-Memphis":   3.60,
-    "Lower Ohio":      3.75,
-    "Cincinnati":      3.80,
+    "Twin Cities":     6.19,   # Upper Mississippi
+    "Mid-Mississippi": 5.32,   # Eastern IA / Western IL stretch
+    "Illinois":        4.64,   # Lower Illinois River
+    "St. Louis":       3.99,   # Confirmed: AMS GTR + dataset description
+    "Cincinnati":      4.69,   # Middle third of Ohio River
+    "Lower Ohio":      4.46,   # Final third of Ohio River
+    "Cairo-Memphis":   3.14,   # Cairo, IL to Memphis, TN
 }
-_DEFAULT_BENCHMARK = 4.20
+_DEFAULT_BENCHMARK = 4.64   # Illinois — most central Midwest fallback
 
+# Bushels per SHORT TON (ton = 2,000 lbs) per AMS GTR methodology
+# Corn: 56 lbs/bu → 2000/56 = 35.714
+# Soybeans/Wheat: 60 lbs/bu → 2000/60 = 33.333
 _BU_PER_TON: Dict[str, float] = {
-    "corn":     39.368,
-    "soybeans": 36.744,
-    "soybean":  36.744,
-    "wheat":    36.744,
+    "corn":     35.714,
+    "soybeans": 33.333,
+    "soybean":  33.333,
+    "wheat":    33.333,
 }
-_DEFAULT_BU_PER_TON = 36.744
+_DEFAULT_BU_PER_TON = 33.333
 
 # ---------------------------------------------------------------------------
 # State → segment / region / origin mappings
