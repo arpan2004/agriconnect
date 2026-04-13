@@ -21,11 +21,11 @@
 
 ## Overview
 
-AgriConnect MCP is a Model Context Protocol server that exposes USDA commodity data through structured tools that any MCP-compatible AI client can call. It bridges two USDA data sources — AMS (Agricultural Marketing Service) and NASS (National Agricultural Statistics Service) — and adds an analysis layer that combines price and transportation cost data to produce ranked selling recommendations.
+AgriConnect MCP is a Model Context Protocol server that exposes USDA commodity data through structured tools that any MCP-compatible AI client can call. It bridges three USDA data sources — AMS MyMarketNews (cash grain prices), AgTransport via Socrata (transportation rates), and NASS QuickStats (historical statistics) — and adds an analysis layer that combines price and transportation cost data to produce ranked selling recommendations.
 
 The server is designed around five properties: correctness of data, security of inputs and outputs, observability of every operation, resilience to external API failure, and full compliance with the MCP specification.
 
-**Primary use case:** A farmer asks a natural language question like *"Where should I sell 25,000 bushels of corn from Ames, Iowa?"* The MCP client routes that question to this server, which fetches live USDA data, cross-joins prices against transportation costs, and returns a ranked list of selling locations with net profit per bushel.
+**Primary use case:** A farmer asks a natural language question like *"Where should I sell 250,000 bushels of corn from Des Moines, Iowa?"* The MCP client routes that question to this server, which fetches live USDA grain prices from AMS and live transport rates from the USDA AgTransport platform, cross-joins them into net-price-per-bushel options, and returns a ranked list of selling locations.
 
 ---
 
@@ -92,12 +92,12 @@ The server is designed around five properties: correctness of data, security of 
 │                         Tool Layer                                   │
 │                    src/tools/*.py                                    │
 │                                                                      │
-│  prices.py      get_cash_prices()         → price table             │
+│  prices.py      get_cash_prices()          → price table            │
 │  transport.py   get_transportation_costs() → rate table             │
-│  analysis.py    rank_selling_options()    → ranked net profit list  │
-│                 simulate_profit()         → total revenue table     │
-│  trends.py      get_market_trends()       → price history table     │
-│                 get_weekly_summary()      → narrative paragraph     │
+│  analysis.py    rank_selling_options()     → ranked net profit list │
+│                 simulate_profit()          → total revenue table    │
+│  trends.py      get_market_trends()        → price history table    │
+│                 get_weekly_summary()       → narrative paragraph    │
 │                                                                      │
 │  Tools are pure functions: receive validated args, call data layer,  │
 │  format output as plain text, return string. No side effects.        │
@@ -111,44 +111,53 @@ The server is designed around five properties: correctness of data, security of 
 │  Every API call checks cache first. Key = SHA-256(url + params).    │
 │                                                                      │
 │  TTLs by data type:                                                  │
-│    Cash prices       15 minutes    (USDA updates ~twice/day)         │
-│    Transport rates    6 hours      (weekly report, stable intraday)  │
-│    NASS history       1 hour       (weekly publication cadence)      │
-│    Geo lookups       24 hours      (static reference data)           │
-│    Health checks     30 seconds                                      │
+│    Cash prices (AMS)       15 minutes   (USDA updates ~twice/day)   │
+│    Transport rates         6 hours      (Socrata updates weekly)     │
+│    NASS history            1 hour       (weekly publication cadence) │
+│    Geo lookups             24 hours     (static reference data)      │
+│    Health checks           30 seconds                               │
 │                                                                      │
 │  Max 500 entries. LRU eviction at capacity. Background sweep        │
 │  every 5 minutes to expire stale entries.                            │
 └──────────┬───────────────────────────────────────────────────────────┘
            │  cache miss only
            │
-           ├──────────────────────────┐
-           ▼                          ▼
-┌────────────────────┐    ┌─────────────────────────┐
-│   ams_client.py    │    │     nass_client.py       │
-│                    │    │                          │
-│  fetch_grain_      │    │  fetch_commodity_        │
-│  prices()          │    │  prices()                │
-│                    │    │                          │
-│  fetch_transport_  │    │  Daily rate limit        │
-│  report()          │    │  tracker (50 req/day     │
-│                    │    │  on free NASS tier)      │
-│  Retry: 3×         │    │  Retry: 2×               │
-│  Backoff: 1.5^n s  │    │  Timeout: 15s            │
-│  Timeout: 12s      │    │                          │
-│  URL allowlist     │    │  URL allowlist           │
-└──────────┬─────────┘    └───────────┬──────────────┘
-           │                          │
-           ▼                          ▼
-┌────────────────────┐    ┌─────────────────────────┐
-│   USDA AMS API     │    │   USDA NASS QuickStats   │
-│                    │    │                          │
-│  marsapi.ams       │    │  quickstats.nass         │
-│  .usda.gov         │    │  .usda.gov/api           │
-│                    │    │                          │
-│  Cash grain prices │    │  Weekly prices received  │
-│  Transport report  │    │  Production statistics   │
-└────────────────────┘    └─────────────────────────┘
+           ├────────────────────┬────────────────────────┐
+           ▼                    ▼                        ▼
+┌──────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
+│  ams_client.py   │  │ transport_client.py  │  │   nass_client.py     │
+│                  │  │                      │  │                      │
+│ fetch_grain_     │  │ fetch_transport_     │  │ fetch_commodity_     │
+│ prices()         │  │ rates()              │  │ prices()             │
+│                  │  │                      │  │                      │
+│ Static registry  │  │ Fetches from 4       │  │ Daily rate limit     │
+│ maps commodity + │  │ Socrata datasets:    │  │ tracker (50 req/day  │
+│ state → slug IDs │  │  • Barge spot rates  │  │ on free NASS tier)   │
+│                  │  │  • Truck rates       │  │                      │
+│ Tries Report     │  │  • Price spreads     │  │ Retry: 2×            │
+│ Detail section   │  │  • Cost indicators   │  │ Timeout: 15s         │
+│ first, falls     │  │                      │  │                      │
+│ back to Header   │  │ No API key required  │  │ URL allowlist        │
+│ narrative        │  │ (public platform).   │  │                      │
+│                  │  │ Optional app token   │  │                      │
+│ Retry: 3×        │  │ raises rate limit.   │  │                      │
+│ Backoff: 1.5^n s │  │                      │  │                      │
+│ Timeout: 12s     │  │ Timeout: 10s         │  │                      │
+│ URL allowlist    │  │ URL allowlist        │  │                      │
+└────────┬─────────┘  └──────────┬───────────┘  └──────────┬───────────┘
+         │                       │                          │
+         ▼                       ▼                          ▼
+┌──────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
+│  USDA AMS API    │  │  USDA AgTransport    │  │  USDA NASS           │
+│                  │  │  (Socrata platform)  │  │  QuickStats API      │
+│ marsapi.ams      │  │                      │  │                      │
+│ .usda.gov        │  │ agtransport.usda.gov │  │ quickstats.nass      │
+│                  │  │                      │  │ .usda.gov/api        │
+│ Cash grain bids  │  │ deqi-uken  Barge     │  │                      │
+│ by state and     │  │ fxkn-2w9c  Truck     │  │ Weekly prices        │
+│ elevator, pulled │  │ an4w-mnp7  Spreads   │  │ received by farmers  │
+│ via slug IDs     │  │ 8uye-ieij  Indices   │  │ Production stats     │
+└──────────────────┘  └──────────────────────┘  └──────────────────────┘
 ```
 
 ---
@@ -159,7 +168,8 @@ This is the exact sequence of operations for every tool call, from client query 
 
 ```
 1.  MCP client sends tool call request
-      { name: "rank_selling_options", arguments: { commodity: "corn", farm_location: "Ames, IA" } }
+      { name: "rank_selling_options",
+        arguments: { commodity: "corn", farm_location: "Des Moines, IA" } }
 
 2.  server.py receives via stdio transport
 
@@ -177,33 +187,48 @@ This is the exact sequence of operations for every tool call, from client query 
 
 6.  trace_tool_call() opens a span, records start time and request ID
 
-7.  Tool function dispatched: rank_selling_options(commodity="corn", farm_location="Ames, IA")
+7.  Tool function dispatched:
+      rank_selling_options(commodity="corn", farm_location="Des Moines, IA")
 
-8.  geo.resolve_location("Ames, IA") → "IA"
+8.  geo.resolve_location("Des Moines, IA") → "IA"
       → Cache check: HIT → return "IA" immediately
       → Cache miss: resolve from lookup table, write to cache (TTL 24h)
 
-9.  fetch_grain_prices("corn", "IA") called concurrently with fetch_transport_report()
-      Both check cache first
+9.  Prices and transport fetched INDEPENDENTLY (not gathered — separate fallbacks)
 
-      For each:
-        → Cache HIT: return immediately, no API call
-        → Cache MISS:
-            a. Validate URL against allowlist (*.usda.gov only)
-            b. Build request with API key from environment (never from args)
-            c. Execute HTTP GET with 12s timeout
-            d. On 429: wait Retry-After seconds, retry
-            e. On 5xx: exponential backoff (1.5^n), retry up to 3×
-            f. On 4xx: fail fast, no retry
-            g. On success: parse JSON, check size limit (5MB max), write to cache
-            h. On all retries exhausted: return labeled fallback data
+    9a. fetch_grain_prices("corn", "IA") — AMS MyMarketNews
+          → Registry lookup: commodity="corn", state="IA" → slug "2850"
+          → Cache HIT: return immediately
+          → Cache MISS:
+              i.  GET /reports/2850?section=Report+Detail (structured rows)
+              ii. If Detail empty → GET /reports/2850 (Report Header)
+                  Parse commodity price from report_narrative text:
+                  "State Average Price: Corn -- $4.08 ..."
+              iii. On failure → return labeled fallback prices
+
+    9b. fetch_transport_rates("IA", "corn") — AgTransport / Socrata
+          → Cache HIT: return immediately
+          → Cache MISS, queries four Socrata datasets:
+              i.  deqi-uken barge spot rates for "Mid-Mississippi" segment
+                  Convert % of tariff → $/bu using 1976 benchmark ($5.32/ton)
+                  and short-ton bushel weight (corn: 35.714 bu/ton)
+              ii. fxkn-2w9c quarterly truck rates for "North Central" region
+                  Column names discovered at runtime via unfiltered fetch
+              iii. an4w-mnp7 price spreads for Iowa corn → Gulf/PNW
+                   |spread| used as implied transport cost
+              iv. 8uye-ieij weekly cost indices for context
+          → Each dataset fails independently; partial results returned
 
 10. _build_selling_options() cross-joins prices × transport rates
-      net_price = cash_price - transport_cost
-      Deduplicate by (market, mode) pair
-      Sort descending by net_price
+      → Filters to rows where rate_per_bushel is not None
+        (cost-index-only rows skipped — no usable rate to subtract)
+      → net_price = cash_price - rate_per_bushel
+      → Deduplicate by (market, mode) pair
+      → Sort descending by net_price
 
 11. Format result as plain text string
+      → volume formatted with commas (250,000 not 250000)
+      → N/A shown for index-only transport rows
 
 12. sanitize_output() scans response for role injection patterns, strips nulls
 
@@ -236,7 +261,7 @@ Runs before every tool call. Implements six explicit defenses.
 
 `validate_tool_args()` enforces the JSON Schema for each tool. It checks required fields, validates enum values against explicit allowlists, enforces numeric minimum and maximum bounds, and rejects any field not declared in the schema (`additionalProperties: false`). This prevents parameter pollution and ensures the application only processes inputs it explicitly expected.
 
-`RateLimiter` is a thread-safe token bucket. It maintains a list of request timestamps and counts only those within a 60-second rolling window. At 30 requests the next call returns False without acquiring a lock — the check is cheap. Status is exposed via the health resource endpoint.
+`RateLimiter` is a thread-safe token bucket. It maintains a list of request timestamps and counts only those within a 60-second rolling window. At 30 requests the next call returns False without acquiring a lock — the check is cheap.
 
 `redact_secrets()` scans any text for patterns matching API key, token, secret, password, and bearer credential formats, and replaces matched values with `[REDACTED]`. This runs on log output to ensure keys set in environment variables never appear in log files even if accidentally included in an error message.
 
@@ -246,29 +271,74 @@ Runs before every tool call. Implements six explicit defenses.
 
 A TTL cache backed by a Python dictionary. Every entry stores a tuple of `(value, expires_at)` where `expires_at` is a Unix timestamp. On `get()`, if the current time exceeds `expires_at`, the entry is deleted and None is returned. On `set()`, if the store is at its 500-entry capacity, the entry with the earliest expiry is evicted first.
 
-A daemon thread runs every 5 minutes and calls `_evict_expired()` to prevent unbounded memory accumulation in long-running deployments. The thread is daemon-flagged so it does not block process shutdown.
-
-Cache keys are SHA-256 hashes of the URL plus sorted parameter dict, truncated to 32 hex characters. This means the same logical query always hits the same cache entry regardless of parameter ordering.
+A daemon thread runs every 5 minutes and calls `_evict_expired()` to prevent unbounded memory accumulation in long-running deployments. Cache keys are SHA-256 hashes of the URL plus sorted parameter dict, truncated to 32 hex characters.
 
 ### ams_client.py
 
-Handles all communication with USDA AMS. The core function `_fetch_with_retry()` is shared by both `fetch_grain_prices()` and `fetch_transport_report()`. It validates the URL against the domain allowlist before making any network call. The API key is read from the environment variable `USDA_AMS_API_KEY` and added as a Bearer header — it is never accepted as a function argument and never appears in logs.
+Handles all communication with USDA AMS MyMarketNews. Uses a **static registry** (`GRAIN_REPORT_REGISTRY`) that maps `(commodity, state)` pairs directly to confirmed slug IDs, populated from a one-time exploration of the `/reports` index (1,049 reports as of April 2026). No runtime index scan occurs.
 
-Retry logic: up to 3 attempts with backoff of `1.5^attempt` seconds. HTTP 429 responses read the `Retry-After` header and sleep that duration. HTTP 4xx responses (except 429) fail fast with no retry since a client error will not improve. HTTP 5xx and timeouts are retried.
+**Report section strategy:** Each slug fetch tries two sections in order:
 
-When all retries are exhausted, the function raises `ConnectionError`. The tool layer catches this and returns the fallback dataset clearly labeled as sample data. The fallback exists so the server remains functional for demonstration when USDA APIs are unavailable — it is not a substitute for live data in production.
+1. `GET /reports/<slug>?section=Report+Detail` — structured per-elevator rows with explicit price fields. Filtered by commodity name against each row.
+2. `GET /reports/<slug>` (Report Header) — falls back to parsing the `report_narrative` text field using commodity-specific regex patterns. Example narrative: `"State Average Price: Corn -- $4.08 (-.39K) Down 2 cents"`. Rows where `report_narrative` is null are silently skipped.
+
+Barge and export supplement slugs are automatically appended to every state lookup to give the selling-options tool more destination market prices.
+
+The API key is read from `USDA_AMS_API_KEY` and sent as HTTP Basic auth. It is never accepted as a function argument and never appears in logs.
+
+Retry logic: up to 3 attempts with backoff of `1.5^attempt` seconds. HTTP 429 reads the `Retry-After` header. HTTP 4xx fails fast. All retries exhausted raises `ConnectionError`, which triggers the fallback path in the tool layer.
+
+### transport_client.py
+
+Handles all communication with the **USDA AgTransport platform** (`agtransport.usda.gov`), a public Socrata instance. No API key is required. The optional `SOCRATA_APP_TOKEN` environment variable raises the anonymous rate limit from 1 to 1,000 requests per second.
+
+Queries four datasets using SoQL (Socrata Query Language — SQL-like syntax documented at `dev.socrata.com/docs/queries/`):
+
+| Dataset ID | Name | What it provides |
+|------------|------|-----------------|
+| `deqi-uken` | Downbound Grain Barge Rates | Weekly spot rate as % of 1976 tariff benchmark, by river segment |
+| `fxkn-2w9c` | Quarterly Grain Truck Rates | $/bu by region and haul distance, quarterly cadence |
+| `an4w-mnp7` | Grain Price Spreads | Origin-to-export $/bu differential — best proxy for total transport cost |
+| `8uye-ieij` | Grain Transport Cost Indicators | Weekly mode indices (truck, rail, barge) — context only, no direct $/bu |
+
+**Barge rate conversion:** The `rate` column in `deqi-uken` is a percentage of the 1976 Waterways Freight Bureau Tariff No. 7 benchmark. Conversion to $/bushel:
+
+```
+$/ton  = (rate_pct / 100) × benchmark_$/short_ton
+$/bu   = $/ton / (2000 lbs/ton ÷ lbs_per_bushel)
+
+Benchmarks (official, from USDA AMS GTR and dataset description):
+  Twin Cities     $6.19/ton    Mid-Mississippi  $5.32/ton
+  Illinois        $4.64/ton    St. Louis        $3.99/ton
+  Cincinnati      $4.69/ton    Lower Ohio       $4.46/ton
+  Cairo-Memphis   $3.14/ton
+
+Lbs per bushel (per AMS GTR methodology, short ton = 2,000 lbs):
+  Corn: 56 lbs/bu → 35.714 bu/ton
+  Soybeans/Wheat: 60 lbs/bu → 33.333 bu/ton
+```
+
+Column names for `fxkn-2w9c` and `8uye-ieij` are discovered at runtime (fetched without `$select`) because they were not verifiable before deployment. Actual column names are logged at INFO level on first fetch so they can be added to the candidate lists in the source.
+
+The unified `fetch_transport_rates()` function returns a normalised list in the transport rate schema that `analysis._build_selling_options()` consumes directly. Rows with `rate_per_bushel=None` (cost-index-only entries) are filtered out in the analysis layer before the selling-options matrix is built.
 
 ### nass_client.py
 
-Structurally similar to `ams_client.py` but with an additional concern: the NASS QuickStats free tier allows only 50 requests per day. A module-level list `_nass_request_log` stores timestamps of all NASS requests made in the current process. Before every API call, `_check_nass_rate_limit()` filters that list to the past 24 hours and compares the count to `NASS_DAILY_LIMIT`. If the limit is reached, the function skips the API call and returns an empty dict, which triggers the fallback path. This limit is configurable via the `NASS_DAILY_LIMIT` environment variable for deployments with paid API access.
+Structurally similar to `ams_client.py` but with an additional concern: the NASS QuickStats free tier allows only 50 requests per day. A module-level list `_nass_request_log` stores timestamps of all NASS requests made in the current process. Before every API call, `_check_nass_rate_limit()` filters that list to the past 24 hours and compares the count to `NASS_DAILY_LIMIT`. If the limit is reached, the function skips the API call and returns an empty dict, triggering the fallback path.
 
 ### tools/analysis.py
 
-The most important file in the system. `rank_selling_options()` and `simulate_profit()` are the tools that justify the server's existence — they are the combination logic that a farmer has no way to do themselves without a data analyst.
+The most important file in the system. `rank_selling_options()` and `simulate_profit()` are the combination tools that produce the core value — a net-price-per-bushel ranking no farmer could easily produce themselves without a data analyst.
 
-`_build_selling_options()` is the core function. It takes the list of price entries and the transport report dict, filters transport rates to the farm's origin state, then iterates every price entry against every transport rate, computing `net_price = cash_price - transport_cost`. A seen-set keyed on `(market, mode)` deduplicates combinations. The result is a flat list of `SellingOption` dataclasses that the calling tool sorts descending by net_price.
+**Key design: independent source fetches with independent fallbacks.** Prices (AMS) and transport rates (Socrata) are fetched sequentially with separate try/except blocks. A failure in one source does not force the other to fall back. If AMS prices are live but Socrata is unreachable, the tool returns live prices against sample transport rates and labels the transport data as fallback — rather than falling back both sources as the old `asyncio.gather()` design did.
 
-The two API calls — prices and transport — are made concurrently with `asyncio.gather()`. If either returns empty, the function falls back gracefully rather than crashing.
+`_build_selling_options()` is the core cross-join. It filters transport rows to the origin state and discards any row where `rate_per_bushel` is `None` (index-only entries from the cost indicators dataset). It then iterates every price entry against every usable transport rate, computing `net_price = cash_price - rate_per_bushel`. A seen-set keyed on `(market, mode)` deduplicates combinations. The result is sorted descending by net_price.
+
+`simulate_profit()` applies the same cross-join and then multiplies `net_price × volume_bushels` for each top option. Volume figures are formatted with commas throughout (250,000 not 250000).
+
+### tools/transport.py
+
+Calls `transport_client.fetch_transport_rates()` rather than the old `ams_client.fetch_transport_report()`. Accepts `commodity` as a parameter alongside `farm_location` so the Socrata barge conversion uses the correct bushel weight for corn vs. soybeans vs. wheat. The `mode` filter guards against `None` by normalising with `(r.get("mode") or "").lower()` before comparison. Rows with `rate_per_bushel=None` display as `"N/A (index)"` in the formatted table with an explanatory footnote.
 
 ### tools/trends.py
 
@@ -278,44 +348,84 @@ The two API calls — prices and transport — are made concurrently with `async
 
 ### utils/geo.py
 
-Translates natural language location inputs into two-letter state codes that USDA APIs accept. Resolves four formats: `"City, ST"`, `"City, State"`, city name alone (against a 100-entry lookup table covering major agricultural centers), five-digit ZIP code (against ZIP prefix ranges), and bare state names or abbreviations. Returns `"IA"` as the default fallback for unresolvable inputs, logging a warning. All results are cached for 24 hours.
+Translates natural language location inputs into two-letter state codes. Resolves four formats: `"City, ST"`, `"City, State"`, city name alone (against a 100-entry lookup table covering major agricultural centers), five-digit ZIP code (against ZIP prefix ranges), and bare state names or abbreviations. Returns `"IA"` as the default fallback for unresolvable inputs, logging a warning. All results are cached for 24 hours.
 
 ### dashboard/app.py
 
-A Streamlit application that reads the three log files from `$LOG_DIR` and renders them. It auto-refreshes every 5 seconds using Streamlit's rerun mechanism. The metrics row shows total calls, success rate, error count, average latency, and security event count. The four tabs cover per-tool performance tables and bar charts, individual trace inspection with child span details, the audit event log with security events expanded by default, and raw server log output.
-
-The dashboard has no write access to any part of the system. It reads log files only.
+A Streamlit application that reads the three log files from `$LOG_DIR` and renders them. It auto-refreshes every 5 seconds. The metrics row shows total calls, success rate, error count, average latency, and security event count. The four tabs cover per-tool performance, individual trace inspection with child span details, the audit event log, and raw server log output. The dashboard has no write access to any part of the system.
 
 ---
 
 ## Data Layer
 
-### USDA AMS MARS API
+### USDA AMS MyMarketNews API
 
 **Base URL:** `https://marsapi.ams.usda.gov/services/v1.2`
 
-Provides grain cash prices reported by elevators and terminals across the US. The report catalog is browsable at the base URL. The relevant reports are daily grain price reports identified by slug codes (e.g., `SJ_GR110`). Responses are JSON with a `results` array.
+Provides grain cash prices reported by elevators and terminals across the US. Reports are identified by slug IDs. The server uses a static registry of confirmed slug IDs rather than querying the `/reports` index at runtime.
 
-**Key fields to map from AMS response:**
+**Report structure for grain bid reports:**
+
+```
+GET /reports/<slug_id>                         → Report Header section
+GET /reports/<slug_id>?section=Report+Detail   → Per-elevator structured rows
+```
+
+The Header section contains `report_narrative` text with state-average prices. The Detail section (when available) contains per-elevator structured rows with explicit price fields. The client tries Detail first and falls back to narrative parsing.
+
+**Key fields mapped from AMS response:**
 
 | AMS Field | Internal Field | Notes |
 |-----------|---------------|-------|
-| `location_name` or similar | `location_name` | Market or elevator name |
-| `state` | `state` | Two-letter state code |
-| `report_date` | `report_date` | ISO date string |
-| Cash price field | `cash_price` | Float, dollars per bushel |
-| Basis field | `basis` | Float, premium/discount vs futures |
-| Office/type field | `market_type` | `terminal`, `elevator`, `processor` |
+| `office_city` / `location_name` | `location_name` | Market or elevator name |
+| `office_state` / `state` | `state` | Two-letter state code |
+| `report_date` / `report_begin_date` | `report_date` | ISO date string |
+| Price field (varies by report) | `cash_price` | Float, dollars per bushel |
+| Basis field (varies by report) | `basis` | Float, premium/discount vs futures |
+| `market_type` / `type` | `market_type` | `terminal`, `elevator`, `processor`, `state_average` |
 
-**Transport report:** Published weekly as a text file at `https://www.ams.usda.gov/mnreports/sj_gr225.txt`. This is not a JSON API — it requires a text parser. The file uses a fixed-width or tab-separated structure with sections for truck, rail, and barge rates by origin region and destination.
+**API key:** Request at `https://marsapi.ams.usda.gov`. Free tier available. Set as `USDA_AMS_API_KEY`.
 
-**API key:** Request at `https://marsapi.ams.usda.gov`. Free tier available.
+### USDA AgTransport Platform (Socrata)
+
+**Base URL:** `https://agtransport.usda.gov/resource`
+
+**Query pattern:** `GET /<dataset_id>.json?$where=...&$order=...&$limit=...&$select=...`
+
+All four datasets used are public. SoQL reference: `https://dev.socrata.com/docs/queries/`
+
+**Confirmed dataset schemas (from live API responses, April 2026):**
+
+`deqi-uken` — Downbound Grain Barge Rates:
+```
+date, week, month, year, location, rate
+```
+`rate` = spot/nearby percent of 1976 tariff benchmark.
+
+`fxkn-2w9c` — Quarterly Grain Truck Rates:
+```
+date, year, quarter, region, [price columns — discovered at runtime]
+```
+
+`an4w-mnp7` — Grain Price Spreads:
+```
+date, week, year, origin, destination, commodity, spread, origin_price, destination_price
+```
+`spread` = destination_price − origin_price ($/bu). Positive spread = exporting profitable.
+
+`8uye-ieij` — Grain Transportation Cost Indicators:
+```
+date, week, year, [index columns — discovered at runtime]
+```
+Index values only. No direct $/bu conversion possible without a base rate.
+
+**Optional app token:** Register at `agtransport.usda.gov`. Set as `SOCRATA_APP_TOKEN`. Without it, anonymous rate limit is 1 request/second.
 
 ### USDA NASS QuickStats API
 
 **Base URL:** `https://quickstats.nass.usda.gov/api/api_GET/`
 
-Provides historical agricultural statistics including weekly prices received by farmers by state and commodity.
+Provides historical agricultural statistics including weekly prices received by farmers.
 
 **Query parameters for weekly corn prices in Iowa:**
 
@@ -330,61 +440,50 @@ freq_desc=WEEKLY
 format=JSON
 ```
 
-**Key fields in NASS response:**
-
-| NASS Field | Notes |
-|-----------|-------|
-| `Value` | Price as string, parse to float |
-| `week_ending` | ISO date of the week ending |
-| `state_alpha` | Two-letter state code |
-| `commodity_desc` | Commodity name |
-| `unit_desc` | Should be `$ / BU` |
-
-**Rate limit:** 50 requests/day on free tier. Paid access available. The `NASS_DAILY_LIMIT` environment variable controls the tracked limit.
-
-**API key:** Request at `https://quickstats.nass.usda.gov/api`. Typically instant approval.
+**Rate limit:** 50 requests/day on free tier. Tracked by `NASS_DAILY_LIMIT`. Set as `USDA_NASS_API_KEY`.
 
 ### Data Shape Contract
 
-All internal code expects these normalized dict shapes after parsing. The client files are responsible for mapping raw API responses to these shapes before returning.
+All internal code expects these normalized dict shapes. Client files are responsible for mapping raw API responses to these shapes before returning.
 
-**Price entry:**
+**Price entry (from ams_client):**
 ```python
 {
-    "location_name": str,     # "Chicago"
-    "state":         str,     # "IL"
-    "market_type":   str,     # "terminal" | "elevator" | "processor"
-    "cash_price":    float,   # 4.9400
-    "basis":         float,   # 0.12 (positive = premium, negative = discount)
-    "report_date":   str,     # "2026-03-01"
-    "data_source":   str,     # "USDA AMS" — include "[SAMPLE]" if fallback
+    "location_name": str,     # "Des Moines (State Avg)" or "Chicago Terminal"
+    "state":         str,     # "IA"
+    "market_type":   str,     # "terminal" | "elevator" | "processor" | "state_average"
+    "cash_price":    float,   # 4.08  (dollars per bushel)
+    "basis":         float,   # 0.0   (0.0 for state averages; actual for elevator rows)
+    "report_date":   str,     # "2026-04-08"
+    "data_source":   str,     # "USDA AMS (2850)" — include "[SAMPLE]" if fallback
 }
 ```
 
-**Transport rate entry:**
+**Transport rate entry (from transport_client):**
 ```python
 {
-    "mode":              str,   # "truck" | "rail" | "barge"
-    "origin_region":     str,   # "IA" (state code)
-    "destination":       str,   # "Chicago IL"
-    "rate_per_bushel":   float, # 0.28
-    "note":              str,   # optional, e.g. "Mississippi River route"
+    "mode":            str,            # "barge" | "truck" | "rail_or_barge" | "rail"
+    "origin_region":   str,            # "IA"
+    "destination":     str,            # "Gulf Export via Mid-Mississippi"
+    "rate_per_bushel": float | None,   # 0.45 — None for index-only rows
+    "note":            str,            # source + context string
+    "source_dataset":  str,            # Socrata dataset ID, e.g. "deqi-uken"
 }
 ```
+
+`rate_per_bushel=None` indicates a cost-index-only row (from `8uye-ieij`). The analysis layer filters these out before building selling options. The transport tool displays them as `"N/A (index)"` in formatted output.
 
 **NASS price entry:**
 ```python
 {
-    "week_ending":        str,   # "2026-03-01"
-    "Value":              str,   # "4.6500" — parse to float when using
-    "commodity_desc":     str,   # "CORN"
-    "state_alpha":        str,   # "IA"
-    "unit_desc":          str,   # "$ / BU"
-    "source_desc":        str,   # "USDA NASS" — include "[SAMPLE]" if fallback
+    "week_ending":   str,   # "2026-03-01"
+    "Value":         str,   # "4.6500" — parse to float when using
+    "commodity_desc":str,   # "CORN"
+    "state_alpha":   str,   # "IA"
+    "unit_desc":     str,   # "$ / BU"
+    "source_desc":   str,   # "USDA NASS" — include "[SAMPLE]" if fallback
 }
 ```
-
-If the actual USDA API response fields differ from these shapes, the fix belongs in the client file (`ams_client.py` or `nass_client.py`). Nothing above the client layer should need to change when the raw API response shape changes.
 
 ---
 
@@ -396,7 +495,7 @@ The system sits between an LLM client and federal public APIs. The relevant thre
 
 **From the client side:** A malicious or jailbroken prompt could attempt to pass injection payloads through tool arguments to manipulate the server's behavior, expose secrets, or cause the server to make unintended requests.
 
-**From the API side:** A compromised or spoofed USDA API response could contain text designed to manipulate the LLM's context when the tool output is returned (context injection / prompt injection through data).
+**From the API side:** A compromised or spoofed USDA API response could contain text designed to manipulate the LLM's context when the tool output is returned (context injection through data).
 
 **From the network:** The server makes outbound HTTP calls, making it a potential SSRF vector if URLs are constructed from user input.
 
@@ -409,17 +508,15 @@ The system sits between an LLM client and federal public APIs. The relevant thre
 | Prompt Injection | Input sanitization with 10 regex patterns covering known injection vectors. Applied to every string argument. | `security.py` |
 | Command Injection | No shell execution anywhere. No subprocess calls. All logic is in-process Python. | Entire codebase |
 | Excessive Permissions | Each tool accesses only its declared USDA endpoints. Tools cannot call other tools. No write operations. | `server.py` tool dispatch |
-| Insecure Resource Access | All outbound URLs validated against a frozenset of allowed domains before any HTTP call. | `ams_client.py`, `nass_client.py` |
-| SSRF | URL allowlist. No user-supplied URLs or URL fragments accepted as arguments. | `ams_client.py`, `nass_client.py` |
+| Insecure Resource Access | All outbound URLs validated against a frozenset of allowed domains before any HTTP call. | `ams_client.py`, `transport_client.py`, `nass_client.py` |
+| SSRF | URL allowlist. No user-supplied URLs or URL fragments accepted as arguments. | All client files |
 | Context Injection | `sanitize_output()` strips role injection patterns and MCP tool tags from API response data before it reaches the client. | `security.py` |
 | Rate Limit Abuse | Token bucket rate limiter at 30 req/min. NASS daily limit tracked separately. Both configurable. | `security.py`, `nass_client.py` |
 | Insecure Deserialization | JSON responses subject to 5MB size limit before parsing. Tool schemas use `additionalProperties: false`. | `security.py`, all schemas |
 
 ### What Secrets Are in the System
 
-Two secrets exist: `USDA_AMS_API_KEY` and `USDA_NASS_API_KEY`. Both are loaded at import time from environment variables. They are used only as HTTP request headers. They are never logged, never included in tool output, never accepted as function arguments, and actively redacted by `redact_secrets()` if they somehow appear in any string that passes through the logging layer.
-
-The `.env.example` file documents where these go. The `.env` file is in `.gitignore`.
+Three secrets exist: `USDA_AMS_API_KEY`, `USDA_NASS_API_KEY`, and optionally `SOCRATA_APP_TOKEN`. The first two are loaded at import time from environment variables, used only as HTTP request headers, never logged, never included in tool output, and actively redacted by `redact_secrets()`. `SOCRATA_APP_TOKEN` is optional — the AgTransport platform is fully public and functional without it; the token only raises the anonymous rate limit.
 
 ---
 
@@ -429,35 +526,30 @@ The `.env.example` file documents where these go. The `.env` file is in `.gitign
 
 All three files are written to the directory specified by the `LOG_DIR` environment variable, defaulting to `/tmp/agriconnect-logs`.
 
-**`server.log`** — Human-readable structured application log. One line per log call. Format: `[HH:MM:SS] LEVEL logger_name — message`. Also written as JSON in parallel for machine parsing. Captures info, warning, and error events from all modules.
+**`server.log`** — Human-readable structured application log. One line per log call. Format: `[HH:MM:SS] LEVEL logger_name — message`.
 
-**`traces.jsonl`** — One JSON object per line, one line per tool call. Written by `ToolCallSpan.finish()` when the trace context manager exits. Fields: `request_id`, `tool_name`, `start_time`, `duration_ms`, `outcome`, `arg_keys` (not values — values are not logged), `child_spans`, `error` (if outcome is error).
+**`traces.jsonl`** — One JSON object per line, one line per tool call. Fields: `request_id`, `tool_name`, `start_time`, `duration_ms`, `outcome`, `arg_keys` (not values), `child_spans`, `error`.
 
-**`audit.jsonl`** — Append-only compliance log. Written by `log_audit_event()` for tool success, tool error, rate limit hits, validation errors, injection detection attempts, and unexpected argument fields. Secrets are scrubbed from metadata before writing. This file is the forensic record — it should never be truncated in production.
+**`audit.jsonl`** — Append-only compliance log for tool success/error, rate limit hits, validation errors, and injection detection attempts.
 
 ### Trace Span Structure
 
 ```python
 {
-    "request_id":   "rank_selling_options-20260301143215123456",
-    "tool_name":    "rank_selling_options",
-    "start_time":   "2026-03-01T14:32:15.123456+00:00",
-    "duration_ms":  847.3,
-    "outcome":      "success",
-    "arg_keys":     ["commodity", "farm_location", "radius_miles"],
-    "child_spans":  [
-        { "name": "cache_check_prices", "duration_ms": 0.4, "result": "miss" },
-        { "name": "ams_api_fetch",       "duration_ms": 612.1 },
-        { "name": "cache_check_transport", "duration_ms": 0.3, "result": "hit" }
+    "request_id":  "rank_selling_options-20260408143215123456",
+    "tool_name":   "rank_selling_options",
+    "start_time":  "2026-04-08T14:32:15.123456+00:00",
+    "duration_ms": 923.4,
+    "outcome":     "success",
+    "arg_keys":    ["commodity", "farm_location", "radius_miles"],
+    "child_spans": [
+        { "name": "ams_prices",       "duration_ms": 621.2 },
+        { "name": "socrata_transport","duration_ms": 287.4 },
     ]
 }
 ```
 
-Argument keys are logged without values. This prevents sensitive or PII-adjacent data (farm location, volume) from appearing in trace files while still allowing debugging of which arguments were passed.
-
-### Dashboard
-
-The Streamlit dashboard at `http://localhost:8501` reads all three log files and renders them in four tabs: tool performance summary with bar charts, individual trace inspector, audit event log with security alerts highlighted, and raw server log. It has no write access to anything. It auto-refreshes every 5 seconds.
+Argument keys are logged without values to avoid retaining sensitive business data (farm location, volume) in trace files.
 
 ---
 
@@ -465,29 +557,25 @@ The Streamlit dashboard at `http://localhost:8501` reads all three log files and
 
 ### HTTP Retry Policy
 
-All USDA API calls go through `_fetch_with_retry()` in each client file. The policy is:
+**AMS client:** Up to 3 attempts, backoff `1.5^attempt` seconds. HTTP 429 reads `Retry-After`. HTTP 4xx fails fast. HTTP 5xx and timeouts retry.
 
-- Maximum 3 attempts for AMS, 2 for NASS
-- Exponential backoff: `1.5^attempt` seconds between retries
-- HTTP 429: read `Retry-After` header, sleep that duration, then retry
-- HTTP 4xx (except 429): fail immediately, do not retry (client error will not improve)
-- HTTP 5xx: retry with backoff
-- Timeout (`httpx.TimeoutException`): retry with backoff
-- All retries exhausted: raise `ConnectionError` with last error message
+**Transport client (Socrata):** Single attempt per dataset. Socrata is highly available and the data is static/weekly — retries are not warranted. Individual dataset failures are logged and skipped; results from other datasets are still returned.
+
+**NASS client:** Up to 2 attempts, 15-second timeout.
 
 ### Graceful Degradation
 
-When `ConnectionError` is raised from a client, the tool layer catches it and returns the fallback dataset. The fallback is structurally identical to live data so the rest of the pipeline — analysis, formatting, ranking — operates normally. All fallback responses include `[SAMPLE]` in the `data_source` field, and the formatted output includes an explicit warning to the user.
+Prices and transport are fetched with **independent fallback paths**. If AMS fails, prices fall back to labeled sample data while transport continues to fetch from Socrata (or vice versa). The selling-options analysis then runs on whatever combination is available, always labeling fallback sources clearly in the output.
 
 The system never crashes for the end user due to a USDA API outage. It degrades to sample data and clearly says so.
 
-### Context Window Protection
+### Rate-Per-Bushel None Filtering
 
-Tools do not return unbounded data to the LLM. Price tables are sorted and the top entries are returned. If USDA APIs return large result sets, the tool formats only the most relevant entries. The analysis tool returns a fixed-width ranked list regardless of how many market combinations exist. This prevents context window overflow for large geographic queries.
+Transport rows from the cost indicators dataset (`8uye-ieij`) have `rate_per_bushel=None` because they provide index values, not usable rates. `_build_selling_options()` filters these out explicitly before building the cross-join matrix. This prevents `None` being cast to `0.0` and producing artificially high net prices.
 
 ### NASS Rate Limit Management
 
-A module-level list tracks the timestamp of every NASS API call made in the current process lifetime. Before each call, entries older than 24 hours are pruned and the remaining count is compared to `NASS_DAILY_LIMIT`. If the limit is reached, the API call is skipped and the cached result (if any) or fallback is returned. This is a best-effort tracker — it resets if the process restarts, and it does not coordinate across multiple server instances.
+A module-level list tracks timestamps of every NASS API call made in the current process. Before each call, entries older than 24 hours are pruned and the count is compared to `NASS_DAILY_LIMIT`. If the limit is reached, the API call is skipped and cached or fallback data is returned.
 
 ---
 
@@ -495,31 +583,25 @@ A module-level list tracks the timestamp of every NASS API call made in the curr
 
 ### Protocol
 
-The server communicates over stdio using JSON-RPC 2.0 as defined by the MCP specification. The `mcp` Python SDK handles framing, serialization, and the protocol handshake. The server declares its capabilities (tools, resources, prompts) during initialization.
+The server communicates over stdio using JSON-RPC 2.0 as defined by the MCP specification. The `mcp` Python SDK handles framing, serialization, and the protocol handshake.
 
 ### Tool Schema Design
 
-Every tool schema uses `additionalProperties: false` to prevent parameter pollution. Required fields are explicitly declared. Enum fields use explicit allowlists rather than open strings for commodity names and transport modes. This means the server rejects any argument combination not explicitly anticipated at design time, which is the correct behavior for a server that makes real API calls.
-
-Tool descriptions are written to be useful to the LLM doing tool selection, not to humans. They describe what the tool returns and when to use it, not how it works internally.
+Every tool schema uses `additionalProperties: false`. The `commodity` argument uses an explicit enum allowlist (`["corn", "soybeans", "wheat"]`). The `mode` argument on the transport tool uses `["truck", "rail", "barge", "rail_or_barge"]`. These enums reflect the actual mode values returned by `transport_client.fetch_transport_rates()`.
 
 ### Resources
 
-Three resources are exposed as MCP resources (readable without a tool call):
+Three resources exposed as MCP resources:
 
-`usda://commodities/supported` — Static JSON list of supported commodities with USDA codes. Useful for clients that want to validate commodity names before calling a tool.
+`usda://commodities/supported` — Static JSON list of supported commodities.
 
-`usda://markets/regions` — Static JSON map of USDA reporting regions and their major markets. Useful for understanding geographic coverage.
+`usda://markets/regions` — Static JSON map of USDA reporting regions.
 
-`usda://status` — Live JSON health check. Returns cache statistics, rate limiter state, and server version. Refreshed on every read.
-
-### Prompts
-
-Three prompt templates are registered with the MCP server. These are pre-filled query strings that MCP clients can surface to users as quick-start options. They cover the farmer selling decision scenario, a market overview request, and a transportation cost comparison. Arguments are sanitized with `sanitize_input()` before interpolation.
+`usda://status` — Live JSON health check with cache statistics, rate limiter state, and server version.
 
 ### Discovery
 
-The `mcp.json` manifest file at the project root describes the server for MCP client discovery: entry point command, environment variables, tool list, resource list, data sources, security properties, and example queries. This file is what a user copies into their Claude Desktop or other MCP client configuration.
+The `mcp.json` manifest at the project root describes the server for MCP client discovery: entry point command, environment variables, tool list, resource list, data sources, security properties, and example queries.
 
 ---
 
@@ -543,13 +625,18 @@ agriconnect-mcp/
 │   ├── cache.py                  # TTL cache with background eviction
 │   │
 │   ├── clients/
-│   │   ├── ams_client.py         # USDA AMS API — prices + transport
-│   │   └── nass_client.py        # USDA NASS QuickStats API — history
+│   │   ├── ams_client.py         # USDA AMS MyMarketNews — grain cash prices
+│   │   │                         # Static registry + two-section fetch strategy
+│   │   ├── transport_client.py   # USDA AgTransport (Socrata) — transport rates
+│   │   │                         # Barge, truck, spreads, cost indices
+│   │   └── nass_client.py        # USDA NASS QuickStats — price history
 │   │
 │   ├── tools/
 │   │   ├── prices.py             # get_cash_prices tool
 │   │   ├── transport.py          # get_transportation_costs tool
+│   │   │                         # Uses transport_client, commodity-aware
 │   │   ├── analysis.py           # rank_selling_options, simulate_profit tools
+│   │   │                         # Independent fallbacks per data source
 │   │   └── trends.py             # get_market_trends, get_weekly_summary tools
 │   │
 │   └── utils/
@@ -570,8 +657,9 @@ All configuration is via environment variables. No configuration files. No hardc
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `USDA_AMS_API_KEY` | No | `""` | USDA AMS MARS API key. Without it, server runs in demo mode. |
+| `USDA_AMS_API_KEY` | No | `""` | USDA AMS MARS API key. Without it, server runs in demo mode using sample prices. |
 | `USDA_NASS_API_KEY` | No | `"DEMO_KEY"` | USDA NASS QuickStats API key. Free tier without it. |
+| `SOCRATA_APP_TOKEN` | No | `""` | USDA AgTransport app token. Without it, anonymous rate limit is 1 req/sec. Register free at `agtransport.usda.gov`. |
 | `LOG_LEVEL` | No | `"INFO"` | Python logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `LOG_DIR` | No | `"/tmp/agriconnect-logs"` | Directory for all log files. Must be writable. |
 | `NASS_DAILY_LIMIT` | No | `50` | NASS requests per day before fallback triggers. Increase for paid tier. |
@@ -580,14 +668,29 @@ All configuration is via environment variables. No configuration files. No hardc
 
 ## Key Design Decisions
 
-**Why stdio transport instead of HTTP?** The MCP specification supports both. stdio is simpler, has no port to expose, requires no authentication layer for the transport itself, and is the standard for local MCP deployments. HTTP transport would be appropriate for a hosted multi-tenant version of this server.
+**Why a static slug registry instead of runtime report discovery?**
+The AMS `/reports` index returns 1,049 reports with no commodity field — only a `report_title` that uses USDA's own naming conventions (e.g., "Iowa Daily Cash Grain Bids", not "Iowa Corn Prices"). Keyword matching against titles proved unreliable in production. A static registry populated from a one-time exploration of the index is explicit, auditable, fast, and requires no index scan at query time. When USDA adds new reports, the registry is updated in source control.
 
-**Why in-memory cache instead of Redis?** Redis adds operational complexity (another process to run, network dependency). The data this server caches is small, process-scoped, and acceptable to lose on restart since USDA APIs are the source of truth. For multi-instance deployments, Redis or Memcached would be the correct choice.
+**Why separate fetches for prices and transport instead of asyncio.gather()?**
+`asyncio.gather()` fails atomically — if one coroutine raises, the exception propagates and both results are lost. Since AMS and Socrata are independent systems with independent failure modes, a failure in one should not force sample data in the other. Separate sequential fetches with separate try/except blocks give independent fallback paths while adding only milliseconds of latency (the Socrata barge fetch is ~300ms; the AMS fetch is ~600ms; they overlap well enough that the additional sequential overhead is acceptable).
 
-**Why fallback data instead of hard failure?** The primary use case is demonstration and development. Hard failure when USDA APIs are unavailable would make the server unusable for most of the hackathon build cycle. The fallback path exercises the entire pipeline — security, analysis, formatting, ranking — with realistic data. In production the fallback should be replaced with a clear error and a cache-only mode that returns the last known good data.
+**Why three separate Socrata datasets instead of one?**
+No single AgTransport dataset covers all three modes (barge, truck, rail) with direct $/bushel rates. Barge rates (`deqi-uken`) require a percentage-of-tariff conversion. Truck rates (`fxkn-2w9c`) are quarterly and regional. Price spreads (`an4w-mnp7`) provide the most actionable implied cost for origin-to-export decisions. Combining all three gives the selling-options tool the richest possible transport picture while each dataset fails independently.
 
-**Why plain text tool output instead of JSON?** MCP tool results go directly into the LLM context. Plain text formatted for readability produces better LLM responses than raw JSON, which the LLM would then need to interpret. The analysis is done in Python before returning; the LLM receives conclusions, not raw data.
+**Why are barge benchmark rates hardcoded rather than fetched?**
+The 1976 Waterways Freight Bureau Tariff No. 7 benchmarks are a fixed historical reference — they have not changed since 1976 and are documented in every USDA Grain Transportation Report. There is no API that returns them; they are a constant of the barge industry's pricing system. Hardcoding them is correct. The values are sourced directly from USDA AMS GTR publications and the `deqi-uken` dataset description, and cited in the code comments.
 
-**Why are arg values not logged in traces?** Farm location and commodity volume are potentially sensitive business information. Logging argument keys confirms which tool was called with what parameters (useful for debugging schema issues) without retaining the actual data values. Audit log entries contain only metadata about the call outcome, not the query content.
+**Why plain text tool output instead of JSON?**
+MCP tool results go directly into the LLM context. Plain text formatted for readability produces better LLM responses than raw JSON, which the LLM would then need to interpret. The analysis is done in Python before returning; the LLM receives conclusions, not raw data.
 
-**Why `additionalProperties: false` on all schemas?** Any field the server did not explicitly anticipate is rejected at validation time rather than silently ignored. This makes schema drift visible immediately and prevents parameter injection attacks where extra fields might be processed by future code additions that aren't aware they could receive untrusted input.
+**Why are arg values not logged in traces?**
+Farm location and commodity volume are potentially sensitive business information. Logging argument keys confirms which tool was called with what parameters (useful for debugging schema issues) without retaining the actual data values.
+
+**Why `additionalProperties: false` on all schemas?**
+Any field the server did not explicitly anticipate is rejected at validation time rather than silently ignored. This makes schema drift visible immediately and prevents parameter injection attacks where extra fields might be processed by future code additions that aren't aware they could receive untrusted input.
+
+**Why stdio transport instead of HTTP?**
+stdio is simpler, has no port to expose, requires no authentication layer for the transport itself, and is the standard for local MCP deployments. HTTP transport would be appropriate for a hosted multi-tenant version of this server.
+
+**Why in-memory cache instead of Redis?**
+Redis adds operational complexity. The data this server caches is small, process-scoped, and acceptable to lose on restart since USDA APIs are the source of truth. For multi-instance deployments, Redis or Memcached would be the correct choice.
