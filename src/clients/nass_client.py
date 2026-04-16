@@ -1,7 +1,7 @@
 import asyncio
 import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import httpx
@@ -16,85 +16,52 @@ ALLOWED_DOMAINS = {"quickstats.nass.usda.gov"}
 NASS_DAILY_LIMIT = int(os.getenv("NASS_DAILY_LIMIT", "50"))
 NASS_TTL = 60 * 60
 
-NASS_SAMPLE = [
-    {
-        "week_ending": "2026-02-02",
-        "Value": "4.52",
-        "commodity_desc": "CORN",
-        "state_alpha": "IA",
-        "unit_desc": "$ / BU",
-        "source_desc": "USDA NASS [SAMPLE]",
-    },
-    {
-        "week_ending": "2026-02-09",
-        "Value": "4.58",
-        "commodity_desc": "CORN",
-        "state_alpha": "IA",
-        "unit_desc": "$ / BU",
-        "source_desc": "USDA NASS [SAMPLE]",
-    },
-    {
-        "week_ending": "2026-02-16",
-        "Value": "4.61",
-        "commodity_desc": "CORN",
-        "state_alpha": "IA",
-        "unit_desc": "$ / BU",
-        "source_desc": "USDA NASS [SAMPLE]",
-    },
-    {
-        "week_ending": "2026-02-23",
-        "Value": "4.67",
-        "commodity_desc": "CORN",
-        "state_alpha": "IA",
-        "unit_desc": "$ / BU",
-        "source_desc": "USDA NASS [SAMPLE]",
-    },
-    {
-        "week_ending": "2026-03-01",
-        "Value": "4.65",
-        "commodity_desc": "CORN",
-        "state_alpha": "IA",
-        "unit_desc": "$ / BU",
-        "source_desc": "USDA NASS [SAMPLE]",
-    },
-]
-
-_nass_request_log: List[float] = []
-
 logger = get_logger("agriconnect.nass")
+
+# -----------------------
+# RATE LIMIT TRACKING
+# -----------------------
+_nass_request_log: List[float] = []
 
 
 def _is_allowed(url: str) -> bool:
-    parsed = urlparse(url)
-    return parsed.netloc in ALLOWED_DOMAINS
+    return urlparse(url).netloc in ALLOWED_DOMAINS
 
 
 def _check_nass_rate_limit() -> bool:
     now = time.time()
-    cutoff = now - 24 * 60 * 60
+    cutoff = now - 86400
+
     while _nass_request_log and _nass_request_log[0] < cutoff:
         _nass_request_log.pop(0)
+
     if len(_nass_request_log) >= NASS_DAILY_LIMIT:
         return False
+
     _nass_request_log.append(now)
     return True
 
 
+# -----------------------
+# HTTP FETCH
+# -----------------------
 async def _fetch_with_retry(params: Dict[str, Any]) -> httpx.Response:
     if not _is_allowed(BASE_URL):
         raise ConnectionError("Blocked by URL allowlist.")
 
     last_error: Exception = ConnectionError("Unknown error")
+
     for attempt in range(1, 3):
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
                 response = await client.get(BASE_URL, params=params)
 
             if response.status_code == 429:
-                retry_after = response.headers.get("Retry-After")
-                sleep_for = float(retry_after) if retry_after else 1.5 ** attempt
-                await asyncio.sleep(sleep_for)
+                await asyncio.sleep(1.5 ** attempt)
                 continue
+
+            if response.status_code == 400:
+                raise ValueError("Bad NASS query (400)")
 
             if 400 <= response.status_code < 500:
                 raise ConnectionError(f"HTTP {response.status_code}")
@@ -102,11 +69,9 @@ async def _fetch_with_retry(params: Dict[str, Any]) -> httpx.Response:
             if response.status_code >= 500:
                 raise httpx.HTTPStatusError("Server error", request=response.request, response=response)
 
-            if len(response.content) > 5 * 1024 * 1024:
-                raise ConnectionError("Response too large")
-
             return response
-        except (httpx.TimeoutException, httpx.HTTPError, ConnectionError) as exc:
+
+        except Exception as exc:
             last_error = exc
             if attempt >= 2:
                 break
@@ -115,54 +80,156 @@ async def _fetch_with_retry(params: Dict[str, Any]) -> httpx.Response:
     raise ConnectionError(str(last_error))
 
 
-def _normalize_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    normalized: List[Dict[str, Any]] = []
-    for item in results:
-        normalized.append(
-            {
-                "week_ending": item.get("week_ending") or item.get("week_ending_date") or "",
-                "Value": item.get("Value") or item.get("value") or "",
-                "commodity_desc": item.get("commodity_desc") or item.get("commodity") or "",
-                "state_alpha": item.get("state_alpha") or item.get("state") or "",
-                "unit_desc": item.get("unit_desc") or "",
-                "source_desc": item.get("source_desc") or "USDA NASS",
-            }
-        )
-    return normalized
-
-
-async def fetch_commodity_prices(commodity: str, state: str) -> List[Dict[str, Any]]:
+# -----------------------
+# CORE FETCH
+# -----------------------
+async def _fetch_quickstats_rows(params: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not _check_nass_rate_limit():
         return []
 
     api_key = os.getenv("USDA_NASS_API_KEY", "DEMO_KEY")
-    params = {
+
+    request_params = {
         "key": api_key,
-        "commodity_desc": commodity.upper(),
-        "statisticcat_desc": "PRICE RECEIVED",
-        "unit_desc": "$ / BU",
-        "agg_level_desc": "STATE",
-        "state_alpha": state,
-        "freq_desc": "WEEKLY",
         "format": "JSON",
+        **{k: v for k, v in params.items() if v not in (None, "")},
     }
 
-    cache_key = make_cache_key(BASE_URL, params)
+    cache_key = make_cache_key(BASE_URL, request_params)
     cached = DEFAULT_CACHE.get(cache_key)
     if cached is not None:
         return cached
 
     try:
-        response = await _fetch_with_retry(params)
+        response = await _fetch_with_retry(request_params)
         payload = response.json()
+
         results = payload.get("data") or payload.get("results") or []
-        normalized = _normalize_results(results)
-        DEFAULT_CACHE.set(cache_key, normalized, NASS_TTL)
-        return normalized
+        if not isinstance(results, list):
+            results = []
+
+        DEFAULT_CACHE.set(cache_key, results, NASS_TTL)
+        return results
+
     except Exception as exc:
         logger.warning(redact_secrets(str(exc)))
-        raise ConnectionError("NASS fetch failed") from exc
+        return []  # <-- important: don't crash upstream
 
 
-def fallback_prices() -> List[Dict[str, Any]]:
-    return [dict(entry) for entry in NASS_SAMPLE]
+# -----------------------
+# NORMALIZATION
+# -----------------------
+def _normalize_fundamental_row(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "year": str(item.get("year") or ""),
+        "Value": item.get("Value") or "",
+        "commodity_desc": item.get("commodity_desc") or "",
+        "state_alpha": item.get("state_alpha") or "",
+        "unit_desc": item.get("unit_desc") or "",
+        "short_desc": item.get("short_desc") or "",
+        "source_desc": item.get("source_desc") or "USDA NASS",
+    }
+
+
+# -----------------------
+# QUERY CONFIG
+# -----------------------
+FUNDAMENTAL_QUERIES = {
+    "corn": {
+        "planted_acres": {
+            "short_descs": [
+                "CORN - ACRES PLANTED",
+                "CORN, GRAIN - ACRES PLANTED",
+            ],
+            "statisticcat_desc": "AREA PLANTED",
+        },
+        "yield": {
+            "short_descs": [
+                "CORN - YIELD, MEASURED IN BU / ACRE",
+            ],
+            "statisticcat_desc": "YIELD",
+        },
+        "production": {
+            "short_descs": [
+                "CORN - PRODUCTION, MEASURED IN BU",
+            ],
+            "statisticcat_desc": "PRODUCTION",
+        },
+    }
+}
+
+
+# -----------------------
+# SMART QUERY ENGINE
+# -----------------------
+async def _fetch_fundamental_metric(
+    commodity: str,
+    state: str,
+    year: int,
+    metric: str,
+) -> Optional[Dict[str, Any]]:
+    config = FUNDAMENTAL_QUERIES.get(commodity.lower(), {}).get(metric)
+    if not config:
+        return None
+
+    base = {
+        "agg_level_desc": "STATE",
+        "state_alpha": state,
+        "year__GE": str(year),  # ✅ FIXED
+        "domain_desc": "TOTAL",
+        "freq_desc": "ANNUAL",
+        "source_desc": "SURVEY",
+    }
+
+    # -----------------------
+    # 1. Try exact short_desc
+    # -----------------------
+    for desc in config.get("short_descs", []):
+        rows = await _fetch_quickstats_rows({
+            **base,
+            "short_desc": desc,
+        })
+        if rows:
+            return _normalize_fundamental_row(rows[0])
+
+    # -----------------------
+    # 2. Fallback: looser query
+    # -----------------------
+    rows = await _fetch_quickstats_rows({
+        **base,
+        "commodity_desc": commodity.upper(),
+        "statisticcat_desc": config.get("statisticcat_desc"),
+    })
+    if rows:
+        return _normalize_fundamental_row(rows[0])
+
+    # -----------------------
+    # 3. Last fallback: even looser
+    # -----------------------
+    rows = await _fetch_quickstats_rows({
+        "commodity_desc": commodity.upper(),
+        "state_alpha": state,
+        "year__GE": str(year),
+    })
+    if rows:
+        return _normalize_fundamental_row(rows[0])
+
+    return None
+
+
+# -----------------------
+# PUBLIC API
+# -----------------------
+async def fetch_crop_fundamentals(
+    commodity: str,
+    state: str,
+    year: int,
+) -> Dict[str, Dict[str, Any]]:
+    snapshot: Dict[str, Dict[str, Any]] = {}
+
+    for metric in ("planted_acres", "yield", "production"):
+        row = await _fetch_fundamental_metric(commodity, state, year, metric)
+        if row:
+            snapshot[metric] = row
+
+    return snapshot

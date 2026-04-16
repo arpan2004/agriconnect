@@ -111,6 +111,7 @@ from cache import DEFAULT_CACHE
 from observability import get_logger, log_audit_event, trace_span
 from security import rate_limiter, sanitize_input, sanitize_output, validate_tool_args
 from tools.analysis import rank_selling_options, simulate_profit
+from tools.fundamentals import get_crop_fundamentals
 from tools.prices import get_cash_prices
 from tools.transport import get_transportation_costs
 from tools.trends import get_market_trends, get_weekly_summary
@@ -166,6 +167,11 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
                 "type": "string",
                 "description": "Origin farm location",
                 "maxLength": 200,
+            },
+            "commodity": {
+                "type": "string",
+                "enum": [c["name"] for c in SUPPORTED_COMMODITIES],
+                "description": "Commodity name",
             },
             "mode": {
                 "type": "string",
@@ -254,6 +260,29 @@ TOOL_SCHEMAS: Dict[str, Dict[str, Any]] = {
         "required": ["commodity", "location"],
         "additionalProperties": False,
     },
+    "get_crop_fundamentals": {
+        "type": "object",
+        "properties": {
+            "commodity": {
+                "type": "string",
+                "enum": ["corn", "soybeans"],
+                "description": "Commodity name for acreage/yield/production snapshot",
+            },
+            "location": {
+                "type": "string",
+                "description": "Farm state or location, e.g. Ames, IA",
+                "maxLength": 200,
+            },
+            "year": {
+                "type": "integer",
+                "minimum": 2000,
+                "maximum": 2100,
+                "description": "Crop year to query",
+            },
+        },
+        "required": ["commodity", "location"],
+        "additionalProperties": False,
+    },
 }
 
 
@@ -290,6 +319,11 @@ async def list_tools():
             description="Get a narrative weekly price summary for a commodity and location.",
             inputSchema=TOOL_SCHEMAS["get_weekly_summary"],
         ),
+        Tool(
+            name="get_crop_fundamentals",
+            description="Get planted acreage, yield, and production for corn or soybeans from USDA NASS.",
+            inputSchema=TOOL_SCHEMAS["get_crop_fundamentals"],
+        ),
     ]
 
 
@@ -320,6 +354,7 @@ async def call_tool(name: str, arguments: dict):
         elif name == "get_transportation_costs":
             text = await get_transportation_costs(
                 sanitized.get("farm_location"),
+                sanitized.get("commodity"),
                 sanitized.get("mode"),
                 span=span,
             )
@@ -348,6 +383,13 @@ async def call_tool(name: str, arguments: dict):
             text = await get_weekly_summary(
                 sanitized.get("commodity"),
                 sanitized.get("location"),
+                span=span,
+            )
+        elif name == "get_crop_fundamentals":
+            text = await get_crop_fundamentals(
+                sanitized.get("commodity"),
+                sanitized.get("location"),
+                sanitized.get("year"),
                 span=span,
             )
         else:
@@ -439,6 +481,15 @@ async def list_prompts():
                 PromptArgument(name="farm_location", description="Farm location", required=True),
             ],
         ),
+        Prompt(
+            name="crop_fundamentals",
+            description="Get acreage, yield, and production for a commodity and location.",
+            arguments=[
+                PromptArgument(name="commodity", description="Commodity name", required=True),
+                PromptArgument(name="location", description="State or city", required=True),
+                PromptArgument(name="year", description="Crop year", required=False),
+            ],
+        ),
     ]
 
 
@@ -463,6 +514,15 @@ async def get_prompt(name: str, arguments: dict):
     elif name == "transport_compare":
         farm_location = sanitized.get("farm_location", "Ames, IA")
         text = f"Compare transportation costs from {farm_location} for common shipping modes."
+    elif name == "crop_fundamentals":
+        commodity = sanitized.get("commodity", "corn")
+        location = sanitized.get("location", "Iowa")
+        year = sanitized.get("year")
+        year_text = f" for {year}" if year else ""
+        text = (
+            f"Show me planted acreage, yield, and production for {commodity} in "
+            f"{location}{year_text}."
+        )
     else:
         raise ValueError(f"Unknown prompt: {name}")
 
