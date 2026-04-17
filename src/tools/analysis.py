@@ -8,6 +8,14 @@ from utils.geo import resolve_location
 
 logger = get_logger("agriconnect.tools.analysis")
 
+from utils.geo import resolve_location, haversine, CITY_COORDS, STATE_CENTROIDS
+
+NEARBY_STATES = {
+    "IA": ["IL", "MN", "MO", "NE", "SD", "WI"],
+    "IL": ["IA", "IN", "MO", "KY", "WI"],
+    "NE": ["IA", "KS", "CO", "SD", "WY"],
+    "MN": ["IA", "WI", "ND", "SD"],
+}
 
 @dataclass
 class SellingOption:
@@ -36,48 +44,51 @@ def _format_table(headers: List[str], rows: List[List[Any]]) -> str:
 
 
 def _build_selling_options(
-    prices: List[dict],
-    transport: List[dict],
-    origin_state: str,
-) -> List[SellingOption]:
+    prices,
+    transport,
+    origin_state,
+    farm_lat,
+    farm_lon,
+):
     if not prices or not transport:
         return []
 
-    # Prefer rates that match the origin state; fall back to all rates
-    filtered_transport = [r for r in transport if r.get("origin_region") == origin_state]
-    if not filtered_transport:
-        filtered_transport = transport
-
-    # Skip transport rows with no usable rate (cost-index-only rows)
-    usable_transport = [
-        r for r in filtered_transport
-        if r.get("rate_per_bushel") is not None
-    ]
+    usable_transport = [r for r in transport if r.get("rate_per_bushel") is not None]
     if not usable_transport:
-        logger.warning(
-            "All transport rows for %s have rate_per_bushel=None (index-only). "
-            "Falling back to all transport rows with non-None rates.",
-            origin_state,
-        )
-        usable_transport = [r for r in transport if r.get("rate_per_bushel") is not None]
-
-    if not usable_transport:
-        logger.warning("No transport rows with a usable rate_per_bushel — cannot build options.")
         return []
 
-    seen: set = set()
-    options: List[SellingOption] = []
+    seen = set()
+    options = []
+
     for price in prices:
-        market     = price.get("location_name", "Unknown")
+        market = price.get("location_name", "Unknown")
         cash_price = float(price.get("cash_price", 0.0))
+
+        market_key = market.lower()
+        if market_key in CITY_COORDS:
+            lat, lon = CITY_COORDS[market_key]
+        else:
+            lat, lon = STATE_CENTROIDS.get(origin_state, (farm_lat, farm_lon))
+
+        distance = haversine(farm_lat, farm_lon, lat, lon)
+
         for rate in usable_transport:
-            mode        = rate.get("mode", "")
+            mode = rate.get("mode", "")
             destination = rate.get("destination", "")
+
             key = (market, mode)
             if key in seen:
                 continue
             seen.add(key)
-            transport_cost = float(rate.get("rate_per_bushel", 0.0))
+
+            rate_val = float(rate.get("rate_per_bushel", 0.0))
+
+            # Distance-aware cost
+            if rate_val < 0.05:  # heuristic for per-mile
+                transport_cost = rate_val * distance
+            else:
+                transport_cost = rate_val
+
             options.append(
                 SellingOption(
                     market=market,
@@ -88,6 +99,7 @@ def _build_selling_options(
                     destination=destination,
                 )
             )
+
     return options
 
 
@@ -104,18 +116,17 @@ async def _fetch_inputs(
     sample = False
 
     # ── Prices (AMS MyMarketNews) ────────────────────────────────────────────
-    prices: List[dict] = []
-    try:
-        if span:
-            with span.child_span("ams_prices"):
-                prices = await ams_client.fetch_grain_prices(commodity, origin_state)
-        else:
-            prices = await ams_client.fetch_grain_prices(commodity, origin_state)
-    except ConnectionError as exc:
-        logger.warning("AMS price fetch failed (%s/%s): %s", commodity, origin_state, str(exc))
+    prices = []
+    states = [origin_state] + NEARBY_STATES.get(origin_state, [])
+
+    for state in states:
+        try:
+            state_prices = await ams_client.fetch_grain_prices(commodity, state)
+            prices.extend(state_prices)
+        except Exception:
+            continue
 
     if not prices:
-        logger.info("Using AMS sample prices for %s/%s.", commodity, origin_state)
         prices = ams_client.fallback_prices()
         sample = True
 
@@ -150,10 +161,16 @@ async def rank_selling_options(
     radius_miles: Optional[int] = None,
     span=None,
 ) -> str:
-    origin_state = resolve_location(farm_location)
+    origin_state, farm_lat, farm_lon = resolve_location(farm_location)
     prices, transport, sample = await _fetch_inputs(commodity, origin_state, span)
 
-    options = _build_selling_options(prices, transport, origin_state)
+    options = _build_selling_options(
+    prices,
+    transport,
+    origin_state,
+    farm_lat,
+    farm_lon,
+)
     if not options:
         return "No selling options available for the provided inputs."
 
@@ -195,10 +212,16 @@ async def simulate_profit(
     top_n: int = 5,
     span=None,
 ) -> str:
-    origin_state = resolve_location(farm_location)
+    origin_state, farm_lat, farm_lon = resolve_location(farm_location)
     prices, transport, sample = await _fetch_inputs(commodity, origin_state, span)
 
-    options = _build_selling_options(prices, transport, origin_state)
+    options = _build_selling_options(
+    prices,
+    transport,
+    origin_state,
+    farm_lat,
+    farm_lon,
+)
     if not options:
         return "No profit simulation available for the provided inputs."
 

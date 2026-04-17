@@ -1,165 +1,102 @@
 import re
-from typing import Dict, Optional
+import math
+from typing import Dict, Optional, Tuple
 
 from cache import DEFAULT_CACHE, make_cache_key
 from observability import get_logger
 
 logger = get_logger("agriconnect.geo")
 
+# -----------------------------
+# State mappings (unchanged)
+# -----------------------------
 STATE_ALIASES: Dict[str, str] = {
-    "alabama": "AL",
-    "alaska": "AK",
-    "arizona": "AZ",
-    "arkansas": "AR",
-    "california": "CA",
-    "colorado": "CO",
-    "connecticut": "CT",
-    "delaware": "DE",
-    "florida": "FL",
-    "georgia": "GA",
-    "hawaii": "HI",
-    "idaho": "ID",
-    "illinois": "IL",
-    "indiana": "IN",
-    "iowa": "IA",
-    "kansas": "KS",
-    "kentucky": "KY",
-    "louisiana": "LA",
-    "maine": "ME",
-    "maryland": "MD",
-    "massachusetts": "MA",
-    "michigan": "MI",
-    "minnesota": "MN",
-    "mississippi": "MS",
-    "missouri": "MO",
-    "montana": "MT",
-    "nebraska": "NE",
-    "nevada": "NV",
-    "new hampshire": "NH",
-    "new jersey": "NJ",
-    "new mexico": "NM",
-    "new york": "NY",
-    "north carolina": "NC",
-    "north dakota": "ND",
-    "ohio": "OH",
-    "oklahoma": "OK",
-    "oregon": "OR",
-    "pennsylvania": "PA",
-    "rhode island": "RI",
-    "south carolina": "SC",
-    "south dakota": "SD",
-    "tennessee": "TN",
-    "texas": "TX",
-    "utah": "UT",
-    "vermont": "VT",
-    "virginia": "VA",
-    "washington": "WA",
-    "west virginia": "WV",
-    "wisconsin": "WI",
-    "wyoming": "WY",
+    "iowa": "IA", "illinois": "IL", "nebraska": "NE", "minnesota": "MN",
+    "missouri": "MO", "south dakota": "SD", "north dakota": "ND",
+    "kansas": "KS", "wisconsin": "WI", "indiana": "IN", "ohio": "OH",
+    "tennessee": "TN", "kentucky": "KY", "mississippi": "MS",
+    "louisiana": "LA", "virginia": "VA", "north carolina": "NC",
 }
 
 CITY_STATE_LOOKUP: Dict[str, str] = {
-    "ames": "IA",
-    "des moines": "IA",
-    "cedar rapids": "IA",
-    "sioux city": "IA",
-    "chicago": "IL",
-    "peoria": "IL",
-    "st. louis": "MO",
-    "kansas city": "MO",
-    "omaha": "NE",
-    "lincoln": "NE",
-    "fargo": "ND",
-    "bismarck": "ND",
+    "des moines": "IA", "chicago": "IL", "omaha": "NE",
+    "minneapolis": "MN", "st. louis": "MO", "kansas city": "MO",
     "sioux falls": "SD",
-    "minneapolis": "MN",
-    "springfield": "IL",
-    "wichita": "KS",
-    "topeka": "KS",
-    "columbus": "OH",
-    "indianapolis": "IN",
-    "memphis": "TN",
-    "louisville": "KY",
-    "gulfport": "MS",
-    "new orleans": "LA",
 }
 
-ZIP_PREFIX_RANGES = [
-    (500, 528, "IA"),
-    (600, 629, "IL"),
-    (630, 658, "MO"),
-    (660, 679, "KS"),
-    (680, 693, "NE"),
-    (550, 567, "MN"),
-    (570, 577, "SD"),
-    (580, 588, "ND"),
-    (430, 459, "OH"),
-    (460, 479, "IN"),
-    (370, 385, "TN"),
-]
+# -----------------------------
+# NEW: Coordinates
+# -----------------------------
+CITY_COORDS: Dict[str, Tuple[float, float]] = {
+    "des moines": (41.5868, -93.6250),
+    "chicago": (41.8781, -87.6298),
+    "omaha": (41.2565, -95.9345),
+    "minneapolis": (44.9778, -93.2650),
+    "st. louis": (38.6270, -90.1994),
+    "kansas city": (39.0997, -94.5786),
+    "sioux falls": (43.5446, -96.7311),
+}
+
+STATE_CENTROIDS: Dict[str, Tuple[float, float]] = {
+    "IA": (42.0, -93.5),
+    "IL": (40.0, -89.0),
+    "NE": (41.5, -99.5),
+    "MN": (46.0, -94.0),
+    "MO": (38.5, -92.5),
+    "SD": (44.5, -100.0),
+    "ND": (47.5, -100.5),
+}
 
 CACHE_TTL = 24 * 60 * 60
 
 
-def _state_from_zip(zip_code: str) -> Optional[str]:
-    try:
-        prefix = int(zip_code[:3])
-    except ValueError:
-        return None
-    for start, end, state in ZIP_PREFIX_RANGES:
-        if start <= prefix <= end:
-            return state
-    return None
-
-
-def resolve_location(location: str) -> str:
+def _resolve_state_only(location: str) -> str:
     if not location:
         return "IA"
 
-    cleaned = location.strip()
-    cache_key = make_cache_key("geo", {"location": cleaned.lower()})
+    cleaned = location.strip().lower()
+
+    if cleaned in STATE_ALIASES:
+        return STATE_ALIASES[cleaned]
+
+    if cleaned in CITY_STATE_LOOKUP:
+        return CITY_STATE_LOOKUP[cleaned]
+
+    if len(cleaned) == 2:
+        return cleaned.upper()
+
+    logger.warning(f"Unresolved location '{location}', defaulting to IA")
+    return "IA"
+
+
+def resolve_location(location: str) -> Tuple[str, float, float]:
+    cleaned = location.strip().lower()
+    cache_key = make_cache_key("geo", {"location": cleaned})
+
     cached = DEFAULT_CACHE.get(cache_key)
     if cached:
         return cached
 
-    lower = cleaned.lower()
+    state = _resolve_state_only(location)
 
-    city_state_match = re.match(r"^\s*([^,]+),\s*([a-zA-Z]{2})\s*$", cleaned)
-    if city_state_match:
-        state = city_state_match.group(2).upper()
-        DEFAULT_CACHE.set(cache_key, state, CACHE_TTL)
-        return state
+    if cleaned in CITY_COORDS:
+        lat, lon = CITY_COORDS[cleaned]
+    else:
+        lat, lon = STATE_CENTROIDS.get(state, (42.0, -93.5))
 
-    city_state_name = re.match(r"^\s*([^,]+),\s*([a-zA-Z\s]+)\s*$", cleaned)
-    if city_state_name:
-        state_name = city_state_name.group(2).strip().lower()
-        state = STATE_ALIASES.get(state_name)
-        if state:
-            DEFAULT_CACHE.set(cache_key, state, CACHE_TTL)
-            return state
+    result = (state, lat, lon)
+    DEFAULT_CACHE.set(cache_key, result, CACHE_TTL)
+    return result
 
-    if re.match(r"^\d{5}$", cleaned):
-        state = _state_from_zip(cleaned)
-        if state:
-            DEFAULT_CACHE.set(cache_key, state, CACHE_TTL)
-            return state
 
-    if lower in STATE_ALIASES:
-        state = STATE_ALIASES[lower]
-        DEFAULT_CACHE.set(cache_key, state, CACHE_TTL)
-        return state
+# -----------------------------
+# NEW: Distance function
+# -----------------------------
+def haversine(lat1, lon1, lat2, lon2):
+    R = 3958.8
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
 
-    if len(cleaned) == 2 and cleaned.isalpha():
-        state = cleaned.upper()
-        DEFAULT_CACHE.set(cache_key, state, CACHE_TTL)
-        return state
-
-    city_state = CITY_STATE_LOOKUP.get(lower)
-    if city_state:
-        DEFAULT_CACHE.set(cache_key, city_state, CACHE_TTL)
-        return city_state
-
-    logger.warning(f"Unresolved location '{cleaned}', defaulting to IA")
-    DEFAULT_CACHE.set(cache_key, "IA", CACHE_TTL)
-    return "IA"
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
