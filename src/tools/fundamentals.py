@@ -41,7 +41,7 @@ async def get_crop_fundamentals(
     year: Optional[int] = None,
     span=None,
 ) -> str:
-    state = resolve_location(location)
+    state, _, _ = resolve_location(location)
     report_year = year if year is not None else datetime.now().year - 1
     sample = False
 

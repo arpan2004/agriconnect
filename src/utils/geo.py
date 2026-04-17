@@ -59,6 +59,13 @@ def _resolve_state_only(location: str) -> str:
     city_state_match = re.match(r"^\s*([^,]+),\s*([A-Za-z]{2})\s*$", location)
     if city_state_match:
         return city_state_match.group(2).upper()
+    
+    city_state_name = re.match(r"^\s*([^,]+),\s*([A-Za-z\s]+)\s*$", cleaned)
+    if city_state_name:
+        state_name = city_state_name.group(2).strip().lower()
+        state = STATE_ALIASES.get(state_name)
+        if state:
+            return state
 
     if cleaned in STATE_ALIASES:
         return STATE_ALIASES[cleaned]
@@ -75,13 +82,23 @@ def _resolve_state_only(location: str) -> str:
 
 def resolve_location(location: str) -> Tuple[str, float, float]:
     cleaned = location.strip().lower()
+
+    state = _resolve_state_only(cleaned)
+
+    # Extract city part if "City, State"
+    city_match = re.match(r"^\s*([^,]+)", cleaned)
+    city_key = city_match.group(1).strip() if city_match else cleaned
+
+    if city_key in CITY_COORDS:
+        lat, lon = CITY_COORDS[city_key]
+    else:
+        lat, lon = STATE_CENTROIDS.get(state, (42.0, -93.5))
     cache_key = make_cache_key("geo", {"location": cleaned})
 
     cached = DEFAULT_CACHE.get(cache_key)
     if cached:
         return cached
 
-    state = _resolve_state_only(location)
 
     if cleaned in CITY_COORDS:
         lat, lon = CITY_COORDS[cleaned]

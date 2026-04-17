@@ -39,7 +39,7 @@ async def get_transportation_costs(
     mode: Optional[str] = None,
     span=None,
 ) -> str:
-    origin_state = resolve_location(farm_location)
+    origin_state, _, _ = resolve_location(farm_location)
     # Guard both optional params against None before any .lower() call
     commodity = (commodity or "corn").lower()
     sample = False
