@@ -116,10 +116,23 @@ GRAIN_REPORT_REGISTRY: Dict[str, Dict[str, List[str]]] = {
 # Narrative format: "Corn -- $4.08 (-.39K) Down 2 cents"
 # Each pattern must have exactly one capture group for the price digits.
 NARRATIVE_COMMODITY_PATTERNS: Dict[str, List[str]] = {
-    "corn":     [r"corn\s*--\s*\$?([\d.]+)"],
-    "soybeans": [r"soybeans?\s*--\s*\$?([\d.]+)"],
-    "soybean":  [r"soybeans?\s*--\s*\$?([\d.]+)"],
-    "wheat":    [r"wheat\s*--\s*\$?([\d.]+)", r"hard\s+red\s+winter\s*--\s*\$?([\d.]+)"],
+    "corn": [
+        r"corn\s*[-–—]*\s*\$?\s*([\d.]+)",   # Corn -- $4.08
+        r"corn\s*:\s*\$?\s*([\d.]+)",        # Corn: 4.29
+    ],
+    "soybeans": [
+        r"soybeans?\s*[-–—]*\s*\$?\s*([\d.]+)",
+        r"soybeans?\s*:\s*\$?\s*([\d.]+)",
+    ],
+    "soybean": [
+        r"soybeans?\s*[-–—]*\s*\$?\s*([\d.]+)",
+        r"soybeans?\s*:\s*\$?\s*([\d.]+)",
+    ],
+    "wheat": [
+        r"wheat\s*[-–—]*\s*\$?\s*([\d.]+)",
+        r"wheat\s*:\s*\$?\s*([\d.]+)",
+        r"hard\s+red\s+winter\s*[-–—]*\s*\$?\s*([\d.]+)",
+    ],
 }
 
 # Substrings for filtering rows in the Report Detail structured section.
@@ -274,14 +287,25 @@ _DETAIL_TYPE_FIELDS = ["market_type", "type", "office_type", "facility_type"]
 
 def _detail_commodity_matches(item: Dict[str, Any], commodity: str) -> bool:
     keywords = DETAIL_COMMODITY_KEYWORDS.get(commodity.lower(), [commodity.lower()])
+
+    found_field = False
+
     for field in _DETAIL_COMMODITY_FIELDS:
         value = item.get(field)
         if value is None:
             continue
+
+        found_field = True
+
         if any(kw in str(value).lower() for kw in keywords):
             return True
-        return False  # field present but different commodity
-    return True  # no commodity field — report is pre-filtered
+
+    # If commodity field exists but didn't match → reject
+    if found_field:
+        return False
+
+    # If no commodity field → assume valid
+    return True
 
 
 def _parse_detail_section(
@@ -334,20 +358,22 @@ def _parse_detail_section(
 # ---------------------------------------------------------------------------
 
 def _extract_price_from_narrative(narrative: str, commodity: str) -> Optional[float]:
-    """
-    Pull the first price for *commodity* out of a report_narrative string.
-    Returns None if not found or narrative is empty/null.
-    """
     if not narrative:
         return None
 
+    # ✅ Normalize text (CRUCIAL FIX)
+    text = narrative.lower()
+    text = text.replace("\n", " ")
+    text = re.sub(r"\s+", " ", text)
+
     for pattern in NARRATIVE_COMMODITY_PATTERNS.get(commodity.lower(), []):
-        match = re.search(pattern, narrative, re.IGNORECASE)
+        match = re.search(pattern, text, re.IGNORECASE)
         if match:
             try:
                 return float(match.group(1))
             except (ValueError, IndexError):
                 continue
+
     return None
 
 
@@ -423,7 +449,14 @@ async def _fetch_slug_prices(
     base_url = f"{BASE_URL}/reports/{slug}"
 
     # --- Step 1: Report Detail (structured rows) ---
-    detail_cache_key = make_cache_key(base_url, {"section": "Report Detail"})
+    detail_cache_key = make_cache_key(
+    base_url,
+    {
+        "section": "Report Detail",
+        "commodity": commodity.lower(),
+        "state": state.upper(),
+    },
+)
     cached = DEFAULT_CACHE.get(detail_cache_key)
     if cached is not None:
         logger.debug("Cache hit (Detail) slug=%s", slug)
