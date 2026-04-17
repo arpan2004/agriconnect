@@ -24,7 +24,7 @@ def _format_table(headers: List[str], rows: List[List[Any]]) -> str:
 
 
 async def get_cash_prices(commodity: str, location: str, radius_miles: Optional[int] = None, span=None) -> str:
-    state = resolve_location(location)
+    state, _, _ = resolve_location(location)
     sample = False
     try:
         if span:

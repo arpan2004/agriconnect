@@ -479,7 +479,13 @@ async def _fetch_slug_prices(
     logger.debug("slug=%s Detail empty for commodity=%r, trying Header narrative", slug, commodity)
 
     # --- Step 2: Report Header (narrative fallback) ---
-    header_cache_key = make_cache_key(base_url, {})
+    header_cache_key = make_cache_key(
+    base_url,
+    {
+        "commodity": commodity.lower(),
+        "state": state.upper(),
+    },
+)
     cached = DEFAULT_CACHE.get(header_cache_key)
     if cached is not None:
         logger.debug("Cache hit (Header) slug=%s", slug)

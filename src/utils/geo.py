@@ -56,6 +56,10 @@ def _resolve_state_only(location: str) -> str:
 
     cleaned = location.strip().lower()
 
+    city_state_match = re.match(r"^\s*([^,]+),\s*([A-Za-z]{2})\s*$", location)
+    if city_state_match:
+        return city_state_match.group(2).upper()
+
     if cleaned in STATE_ALIASES:
         return STATE_ALIASES[cleaned]
 
